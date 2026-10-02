@@ -15,6 +15,25 @@ use core::ops::{Deref, DerefMut};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+struct SharedError(Error);
+
+impl Debug for SharedError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+impl Display for SharedError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+impl StdError for SharedError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.0.source()
+    }
+}
 
 impl Error {
     /// Create a new error object from any error type.
@@ -155,6 +174,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<E>,
             object_downcast: object_downcast::<E>,
             object_drop_rest: object_drop_front::<E>,
+            object_is_unique: object_is_unique::<E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -179,6 +199,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<MessageError<M>>,
             object_downcast: object_downcast::<M>,
             object_drop_rest: object_drop_front::<M>,
+            object_is_unique: object_is_unique::<MessageError<M>>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -204,6 +225,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<DisplayError<M>>,
             object_downcast: object_downcast::<M>,
             object_drop_rest: object_drop_front::<M>,
+            object_is_unique: object_is_unique::<DisplayError<M>>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -235,6 +257,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<ContextError<C, E>>,
             object_downcast: context_downcast::<C, E>,
             object_drop_rest: context_drop_rest::<C, E>,
+            object_is_unique: context_is_unique::<C, E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -260,6 +283,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<BoxedError>,
             object_downcast: object_downcast::<Box<dyn StdError + Send + Sync>>,
             object_drop_rest: object_drop_front::<Box<dyn StdError + Send + Sync>>,
+            object_is_unique: object_is_unique::<BoxedError>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -286,6 +310,7 @@ impl Error {
         let inner: Box<ErrorImpl<E>> = Box::new(ErrorImpl {
             vtable,
             backtrace,
+            references: AtomicUsize::new(1),
             _object: error,
         });
         // Erase the concrete type of E from the compile-time type system. This
@@ -372,6 +397,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<ContextError<C, Error>>,
             object_downcast: context_chain_downcast::<C>,
             object_drop_rest: context_chain_drop_rest::<C>,
+            object_is_unique: context_chain_is_unique::<C>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: context_backtrace::<C>,
         };
@@ -473,6 +499,11 @@ impl Error {
     where
         E: Display + Debug + Send + Sync + 'static,
     {
+        // Moving a value out of the erased allocation is only possible when
+        // this is its sole owner. A cloned Error must remain a shared value.
+        if !self.is_unique() {
+            return Err(self);
+        }
         let target = TypeId::of::<E>();
         let inner = self.inner.by_mut();
         unsafe {
@@ -551,6 +582,12 @@ impl Error {
     where
         E: Display + Debug + Send + Sync + 'static,
     {
+        // Clones share the erased allocation. Never hand out mutable access
+        // unless this is the sole owner; otherwise two independently-owned
+        // Error values could mutate the same payload concurrently.
+        if !self.is_unique() {
+            return None;
+        }
         let target = TypeId::of::<E>();
         unsafe {
             // Use vtable to find NonNull<()> which points to a value of type E
@@ -602,6 +639,9 @@ impl Error {
     #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
     #[must_use]
     pub fn into_boxed_dyn_error(self) -> Box<dyn StdError + Send + Sync + 'static> {
+        if !self.is_unique() {
+            return Box::new(SharedError(self));
+        }
         let outer = ManuallyDrop::new(self);
         unsafe {
             // Use vtable to attach ErrorImpl<E>'s native StdError vtable for
@@ -645,12 +685,19 @@ impl Error {
     pub fn reallocate_into_boxed_dyn_error_without_backtrace(
         self,
     ) -> Box<dyn StdError + Send + Sync + 'static> {
+        if !self.is_unique() {
+            return Box::new(SharedError(self));
+        }
         let outer = ManuallyDrop::new(self);
         unsafe {
             // Use vtable to attach E's native StdError vtable for the right
             // original type E.
             (vtable(outer.inner.ptr).object_reallocate_boxed)(outer.inner)
         }
+    }
+
+    fn is_unique(&self) -> bool {
+        unsafe { (vtable(self.inner.ptr).object_is_unique)(self.inner.by_ref()) }
     }
 
     #[cfg(error_generic_member_access)]
@@ -694,6 +741,13 @@ impl Deref for Error {
 #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
 impl DerefMut for Error {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // There is no clone operation available for an arbitrary erased
+        // error, so copy-on-write is impossible here. Refuse mutable access
+        // while a clone exists rather than creating aliased &mut references.
+        assert!(
+            self.is_unique(),
+            "cannot mutably access a shared anyhow::Error"
+        );
         unsafe { ErrorImpl::error_mut(self.inner.by_mut()) }
     }
 }
@@ -713,8 +767,15 @@ impl Debug for Error {
 impl Drop for Error {
     fn drop(&mut self) {
         unsafe {
-            // Invoke the vtable's drop behavior.
-            (vtable(self.inner.ptr).object_drop)(self.inner);
+            // Only the final shared owner may destroy the erased payload.
+            if (*self.inner.ptr.as_ptr())
+                .references
+                .fetch_sub(1, Ordering::Release)
+                == 1
+            {
+                core::sync::atomic::fence(Ordering::Acquire);
+                (vtable(self.inner.ptr).object_drop)(self.inner);
+            }
         }
     }
 }
@@ -728,6 +789,7 @@ struct ErrorVTable {
     object_reallocate_boxed: unsafe fn(Own<ErrorImpl>) -> Box<dyn StdError + Send + Sync + 'static>,
     object_downcast: unsafe fn(Ref<ErrorImpl>, TypeId) -> Option<Ref<()>>,
     object_drop_rest: unsafe fn(Own<ErrorImpl>, TypeId),
+    object_is_unique: unsafe fn(Ref<ErrorImpl>) -> bool,
     #[cfg(all(not(error_generic_member_access), feature = "std"))]
     object_backtrace: unsafe fn(Ref<ErrorImpl>) -> Option<&Backtrace>,
 }
@@ -738,6 +800,10 @@ unsafe fn object_drop<E>(e: Own<ErrorImpl>) {
     // Layout to deallocate the Box's memory.
     let unerased_own = e.cast::<ErrorImpl<E>>();
     drop(unsafe { unerased_own.boxed() });
+}
+
+unsafe fn object_is_unique<E>(e: Ref<ErrorImpl>) -> bool {
+    unsafe { (*e.ptr.as_ptr()).references.load(Ordering::Acquire) == 1 }
 }
 
 // Safety: requires layout of *e to match ErrorImpl<E>.
@@ -830,6 +896,10 @@ where
     }
 }
 
+unsafe fn context_is_unique<C, E>(e: Ref<ErrorImpl>) -> bool {
+    unsafe { (*e.ptr.as_ptr()).references.load(Ordering::Acquire) == 1 }
+}
+
 // Safety: requires layout of *e to match ErrorImpl<ContextError<C, E>>.
 #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
 unsafe fn context_drop_rest<C, E>(e: Own<ErrorImpl>, target: TypeId)
@@ -888,6 +958,15 @@ where
     }
 }
 
+unsafe fn context_chain_is_unique<C>(e: Ref<ErrorImpl>) -> bool {
+    if unsafe { (*e.ptr.as_ptr()).references.load(Ordering::Acquire) != 1 } {
+        return false;
+    }
+    let unerased = unsafe { e.cast::<ErrorImpl<ContextError<C, Error>>>().deref() };
+    let inner = &unerased._object.error;
+    unsafe { (vtable(inner.inner.ptr).object_is_unique)(inner.inner.by_ref()) }
+}
+
 // Safety: requires layout of *e to match ErrorImpl<ContextError<C, Error>>.
 #[cfg(all(not(error_generic_member_access), feature = "std"))]
 #[allow(clippy::unnecessary_wraps)]
@@ -908,9 +987,39 @@ where
 pub(crate) struct ErrorImpl<E = ()> {
     vtable: &'static ErrorVTable,
     backtrace: Option<Backtrace>,
+    // The erased payload cannot in general be cloned. Keep cloned Error
+    // values as shared owners instead, just like Arc<T> does.
+    references: AtomicUsize,
     // NOTE: Don't use directly. Use only through vtable. Erased type may have
     // different alignment.
     _object: E,
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        // The allocation is deliberately shared: the erased error is not
+        // required to implement Clone. Atomic refcounting also makes this
+        // operation safe when Errors are sent between threads.
+        unsafe {
+            let references = &(*self.inner.ptr.as_ptr()).references;
+            let mut current = references.load(Ordering::Relaxed);
+            loop {
+                if current == usize::MAX {
+                    panic!("anyhow::Error reference count overflow");
+                }
+                match references.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+        }
+        Error { inner: self.inner }
+    }
 }
 
 // Reads the vtable out of `p`. This is the same as `p.as_ref().vtable`, but
